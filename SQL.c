@@ -29,10 +29,33 @@ const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 
 const uint32_t PAGE_SIZE = 4096;
 #define TABLE_MAX_PAGES 100
-const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
-const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
-// Serialization
+// Node header constants
+const uint32_t NODE_TYPE_SIZE = sizeof(uint8_t);
+const uint32_t NODE_TYPE_OFFSET = 0;
+const uint32_t IS_ROOT_SIZE = sizeof(uint8_t);
+const uint32_t IS_ROOT_OFFSET = NODE_TYPE_SIZE;
+const uint32_t PARENT_POINTER_SIZE = sizeof(uint32_t);
+const uint32_t PARENT_POINTER_OFFSET = IS_ROOT_OFFSET + IS_ROOT_SIZE;
+const uint8_t COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE;
+
+// Leaf node constants
+const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);
+const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
+const uint32_t LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE;
+
+const uint32_t LEAF_NODE_KEY_SIZE = sizeof(uint32_t);
+const uint32_t LEAF_NODE_KEY_OFFSET = 0;
+const uint32_t LEAF_NODE_VALUE_SIZE = ROW_SIZE;
+const uint32_t LEAF_NODE_VALUE_OFFSET = LEAF_NODE_KEY_SIZE;
+const uint32_t LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
+const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
+const uint32_t LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
+
+// Enums
+enum NodeType { NODE_LEAF, NODE_INTERNAL };
+
+// Serialization 
 void serialize_row(Row* source, void* destination) {
   memcpy(destination + ID_OFFSET, &(source->id), ID_SIZE);
   strncpy(destination + USERNAME_OFFSET, source->username, USERNAME_SIZE);
@@ -45,7 +68,7 @@ void deserialize_row(void* source, Row* destination) {
   memcpy(&(destination->email), source + EMAIL_OFFSET, EMAIL_SIZE);
 }
 
-// Data structure
+// Data structures
 typedef struct {
   int file_descriptor;
   uint32_t file_length;
@@ -54,15 +77,47 @@ typedef struct {
 
 typedef struct {
   Pager* pager;
-  uint32_t num_rows;
+  uint32_t root_page_num;
 } Table;
 
-// 1. cursor: represents a location in the database.
 typedef struct {
   Table* table;
-  uint32_t row_num;
-  bool end_of_table; // Indicates the position one past the last element
+  uint32_t cell_num;
+  bool end_of_table;
 } Cursor;
+
+// Node accessor functions (new for part 7)
+uint8_t* node_type(void* node) { return node + NODE_TYPE_OFFSET; }
+
+bool is_node_root(void* node) {
+  uint8_t value = *(uint8_t*)(node + IS_ROOT_OFFSET);
+  return (bool)value;
+}
+
+void set_node_root(void* node, bool is_root) {
+  uint8_t value = is_root;
+  *(uint8_t*)(node + IS_ROOT_OFFSET) = value;
+}
+
+uint32_t* leaf_node_num_cells(void* node) {
+  return node + LEAF_NODE_NUM_CELLS_OFFSET;
+}
+
+void* leaf_node_cell(void* node, uint32_t cell_num) {
+  return node + LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
+}
+
+uint32_t* leaf_node_key(void* node, uint32_t cell_num) {
+  return leaf_node_cell(node, cell_num) + LEAF_NODE_KEY_OFFSET;
+}
+
+void* leaf_node_value(void* node, uint32_t cell_num) {
+  return leaf_node_cell(node, cell_num) + LEAF_NODE_VALUE_OFFSET;
+}
+
+void initialize_leaf_node(void* node) {
+  *leaf_node_num_cells(node) = 0;
+}
 
 // Pager and table functions
 void* get_page(Pager* pager, uint32_t page_num) {
@@ -114,13 +169,20 @@ Pager* pager_open(const char* filename) {
   return pager;
 }
 
+// Updated for part 7: initializes the root node as an empty leaf node.
 Table* db_open(const char* filename) {
   Pager* pager = pager_open(filename);
-  uint32_t num_rows = pager->file_length / ROW_SIZE;
 
   Table* table = malloc(sizeof(Table));
   table->pager = pager;
-  table->num_rows = num_rows;
+  table->root_page_num = 0;
+
+  if (pager->file_length == 0) {
+    void* root_node = get_page(pager, 0);
+    *node_type(root_node) = NODE_LEAF;
+    set_node_root(root_node, true);
+    initialize_leaf_node(root_node);
+  }
 
   return table;
 }
@@ -144,75 +206,57 @@ void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
   }
 }
 
+// Updated for part 7: flushes the root node to disk.
 void db_close(Table* table) {
   Pager* pager = table->pager;
-  uint32_t num_full_pages = table->num_rows / ROWS_PER_PAGE;
-
-  for (uint32_t i = 0; i < num_full_pages; i++) {
-    if (pager->pages[i] == NULL) continue;
-    pager_flush(pager, i, PAGE_SIZE);
-    free(pager->pages[i]);
-    pager->pages[i] = NULL;
-  }
-
-  uint32_t num_additional_rows = table->num_rows % ROWS_PER_PAGE;
-  if (num_additional_rows > 0) {
-    uint32_t page_num = num_full_pages;
-    if (pager->pages[page_num] != NULL) {
-      pager_flush(pager, page_num, num_additional_rows * ROW_SIZE);
-      free(pager->pages[page_num]);
-      pager->pages[page_num] = NULL;
-    }
-  }
+  
+  void* root_node = get_page(pager, table->root_page_num);
+  pager_flush(pager, table->root_page_num, PAGE_SIZE);
+  free(root_node);
 
   int result = close(pager->file_descriptor);
   if (result == -1) {
     printf("Error closing db file.\n");
     exit(EXIT_FAILURE);
   }
-  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
-    void* page = pager->pages[i];
-    if (page) {
-      free(page);
-      pager->pages[i] = NULL;
-    }
-  }
   free(pager);
   free(table);
 }
 
 // Cursor functions
-// 2. cursor navigation: these functions abstract how we move through the data.
 Cursor* table_start(Table* table) {
   Cursor* cursor = malloc(sizeof(Cursor));
   cursor->table = table;
-  cursor->row_num = 0;
-  cursor->end_of_table = (table->num_rows == 0);
+  cursor->cell_num = 0;
+
+  void* root_node = get_page(table->pager, table->root_page_num);
+  uint32_t num_cells = *leaf_node_num_cells(root_node);
+  cursor->end_of_table = (num_cells == 0);
+
   return cursor;
 }
 
 Cursor* table_end(Table* table) {
+  void* root_node = get_page(table->pager, table->root_page_num);
+  uint32_t num_cells = *leaf_node_num_cells(root_node);
+
   Cursor* cursor = malloc(sizeof(Cursor));
   cursor->table = table;
-  cursor->row_num = table->num_rows;
+  cursor->cell_num = num_cells;
   cursor->end_of_table = true;
+
   return cursor;
 }
 
 void cursor_advance(Cursor* cursor) {
-  cursor->row_num += 1;
-  if (cursor->row_num >= cursor->table->num_rows) {
+  cursor->cell_num += 1;
+  if (cursor->cell_num >= *leaf_node_num_cells(get_page(cursor->table->pager, cursor->table->root_page_num))) {
     cursor->end_of_table = true;
   }
 }
 
-// 3. cursor value: returns a pointer to the raw bytes in the page.
 void* cursor_value(Cursor* cursor) {
-  uint32_t page_num = cursor->row_num / ROWS_PER_PAGE;
-  void* page = get_page(cursor->table->pager, page_num);
-  uint32_t row_offset = cursor->row_num % ROWS_PER_PAGE;
-  uint32_t byte_offset = row_offset * ROW_SIZE;
-  return page + byte_offset;
+  return leaf_node_value(get_page(cursor->table->pager, cursor->table->root_page_num), cursor->cell_num);
 }
 
 // Repl and input buffer
@@ -248,7 +292,12 @@ void close_input_buffer(InputBuffer* input_buffer) {
 }
 
 // Enums and statement
-typedef enum { META_COMMAND_SUCCESS, META_COMMAND_UNRECOGNIZED_COMMAND } MetaCommandResult;
+typedef enum { 
+  META_COMMAND_SUCCESS, 
+  META_COMMAND_UNRECOGNIZED_COMMAND,
+  META_COMMAND_BTREE // New line added for part 7
+} MetaCommandResult;
+
 typedef enum { PREPARE_SUCCESS, PREPARE_UNRECOGNIZED_STATEMENT, PREPARE_SYNTAX_ERROR, PREPARE_STRING_TOO_LONG, PREPARE_NEGATIVE_ID } PrepareResult;
 typedef enum { STATEMENT_INSERT, STATEMENT_SELECT } StatementType;
 
@@ -257,12 +306,26 @@ typedef struct {
   Row row_to_insert;
 } Statement;
 
-// Meta command
+// Meta command 
+// New for part 7: helps to print the B-Tree structure
+void print_leaf_node(void* node) {
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  printf("leaf (size %d)\n", num_cells);
+  for (uint32_t i = 0; i < num_cells; i++) {
+    uint32_t key = *leaf_node_key(node, i);
+    printf("  - %d : %d\n", i, key);
+  }
+}
+
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
   if (strcmp(input_buffer->buffer, ".exit") == 0) {
     close_input_buffer(input_buffer);
     db_close(table);
     exit(EXIT_SUCCESS);
+  } else if (strcmp(input_buffer->buffer, ".btree") == 0) { // New line for part 7
+    printf("Tree:\n");
+    print_leaf_node(get_page(table->pager, table->root_page_num));
+    return META_COMMAND_SUCCESS;
   } else {
     return META_COMMAND_UNRECOGNIZED_COMMAND;
   }
@@ -302,30 +365,31 @@ void print_row(Row* row) {
   printf("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
 
-// 4. updated execute_insert: uses table_end() to find the insertion point.
+// Updated for part 7: still just appends to the end
 void execute_insert(Statement* statement, Table* table) {
-  if (table->num_rows >= TABLE_MAX_ROWS) {
+  void* node = get_page(table->pager, table->root_page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+
+  if (num_cells >= LEAF_NODE_MAX_CELLS) {
     printf("Error: Table full.\n");
     return;
   }
 
   Row* row_to_insert = &(statement->row_to_insert);
-  Cursor* cursor = table_end(table);
+  uint32_t key_to_insert = row_to_insert->id;
 
-  // Serialize directly into the memory location pointed to by the cursor.
-  serialize_row(row_to_insert, cursor_value(cursor));
-  table->num_rows += 1;
+  // Just append to the end of the leaf node
+  *leaf_node_key(node, num_cells) = key_to_insert;
+  serialize_row(row_to_insert, leaf_node_value(node, num_cells));
+  *leaf_node_num_cells(node) = num_cells + 1;
 
-  free(cursor);
   printf("Executed.\n");
 }
 
-// 5. updated execute_select: uses table_start() and deserializes from the cursor pointer.
 void execute_select(Statement* statement, Table* table) {
   Cursor* cursor = table_start(table);
   Row row;
   while (!(cursor->end_of_table)) {
-    // Gets the raw bytes from the cursor then deserialize them into a Row struct.
     deserialize_row(cursor_value(cursor), &row);
     print_row(&row);
     cursor_advance(cursor);
@@ -363,6 +427,7 @@ int main(int argc, char* argv[]) {
         case META_COMMAND_UNRECOGNIZED_COMMAND:
           printf("Unrecognized command '%s'\n", input_buffer->buffer);
           continue;
+        case META_COMMAND_BTREE: continue;
       }
     }
 
