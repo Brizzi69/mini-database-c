@@ -7,8 +7,7 @@
 #include <stdint.h>
 #include <unistd.h>
 
-// Constant and macros
-// This macro calculates the exact byte size of a struct member
+// Constants and macros
 #define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
 
 const uint32_t COLUMN_USERNAME_SIZE = 32;
@@ -16,8 +15,8 @@ const uint32_t COLUMN_EMAIL_SIZE = 255;
 
 typedef struct {
   uint32_t id;
-  char username[COLUMN_USERNAME_SIZE + 1]; // +1 for null terminator
-  char email[COLUMN_EMAIL_SIZE + 1];       // +1 for null terminator
+  char username[COLUMN_USERNAME_SIZE + 1];
+  char email[COLUMN_EMAIL_SIZE + 1];
 } Row;
 
 const uint32_t ID_SIZE = size_of_attribute(Row, id);
@@ -28,50 +27,44 @@ const uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
 const uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
 const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 
-// I use 4KB pages because it matches the OS's virtual memory page size.
 const uint32_t PAGE_SIZE = 4096;
 #define TABLE_MAX_PAGES 100
 const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
 const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
 // Serialization
-// Converts a row struct into a compact byte array for disk storage.
 void serialize_row(Row* source, void* destination) {
   memcpy(destination + ID_OFFSET, &(source->id), ID_SIZE);
-  // We use strncpy to ensure we don't write uninitialized memory junk to the file.
   strncpy(destination + USERNAME_OFFSET, source->username, USERNAME_SIZE);
   strncpy(destination + EMAIL_OFFSET, source->email, EMAIL_SIZE);
 }
 
-// Converts bytes from disk back into a row struct.
 void deserialize_row(void* source, Row* destination) {
   memcpy(&(destination->id), source + ID_OFFSET, ID_SIZE);
   memcpy(&(destination->username), source + USERNAME_OFFSET, USERNAME_SIZE);
   memcpy(&(destination->email), source + EMAIL_OFFSET, EMAIL_SIZE);
 }
 
-// Data structures
-// 1. pager: manages the cache and the file descriptor.
+// Data structure
 typedef struct {
   int file_descriptor;
   uint32_t file_length;
-  void* pages[TABLE_MAX_PAGES]; // The buffer pool (RAM cache)
+  void* pages[TABLE_MAX_PAGES];
 } Pager;
 
-// 2. table: now points to a pager instead of holding data directly.
 typedef struct {
   Pager* pager;
   uint32_t num_rows;
 } Table;
 
+// 1. cursor: represents a location in the database.
 typedef struct {
   Table* table;
   uint32_t row_num;
-  bool end_of_table;
+  bool end_of_table; // Indicates the position one past the last element
 } Cursor;
 
 // Pager and table functions
-// The core of the buffer pool. Gets a page from RAM or reads it from disk if missing.
 void* get_page(Pager* pager, uint32_t page_num) {
   if (page_num > TABLE_MAX_PAGES) {
     printf("Tried to fetch page number out of bounds. %d > %d\n", page_num, TABLE_MAX_PAGES);
@@ -79,7 +72,6 @@ void* get_page(Pager* pager, uint32_t page_num) {
   }
 
   if (pager->pages[page_num] == NULL) {
-    // Cache miss, allocate memory and load from file.
     void* page = malloc(PAGE_SIZE);
     uint32_t num_pages = pager->file_length / PAGE_SIZE;
 
@@ -102,18 +94,8 @@ void* get_page(Pager* pager, uint32_t page_num) {
   return pager->pages[page_num];
 }
 
-void* row_slot(Table* table, uint32_t row_num) {
-  uint32_t page_num = row_num / ROWS_PER_PAGE;
-  void* page = get_page(table->pager, page_num);
-  uint32_t row_offset = row_num % ROWS_PER_PAGE;
-  uint32_t byte_offset = row_offset * ROW_SIZE;
-  return page + byte_offset;
-}
-
 Pager* pager_open(const char* filename) {
-  // Opens file in read/write mode and creates if it doesn't exist
   int fd = open(filename, O_RDWR | O_CREAT, S_IWUSR | S_IRUSR);
-
   if (fd == -1) {
     printf("Unable to open file %s\n", filename);
     exit(EXIT_FAILURE);
@@ -143,7 +125,6 @@ Table* db_open(const char* filename) {
   return table;
 }
 
-// Flushes a page from RAM to the physical file on disk.
 void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
   if (pager->pages[page_num] == NULL) {
     printf("Tried to flush null page\n");
@@ -151,21 +132,18 @@ void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
   }
 
   off_t offset = lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
-
   if (offset == -1) {
     printf("Error seeking: %d\n", errno);
     exit(EXIT_FAILURE);
   }
 
   ssize_t bytes_written = write(pager->file_descriptor, pager->pages[page_num], size);
-
   if (bytes_written == -1) {
     printf("Error writing: %d\n", errno);
     exit(EXIT_FAILURE);
   }
 }
 
-// Closes the database: saves everything to disk and frees memory.
 void db_close(Table* table) {
   Pager* pager = table->pager;
   uint32_t num_full_pages = table->num_rows / ROWS_PER_PAGE;
@@ -204,11 +182,20 @@ void db_close(Table* table) {
 }
 
 // Cursor functions
+// 2. cursor navigation: these functions abstract how we move through the data.
 Cursor* table_start(Table* table) {
   Cursor* cursor = malloc(sizeof(Cursor));
   cursor->table = table;
   cursor->row_num = 0;
   cursor->end_of_table = (table->num_rows == 0);
+  return cursor;
+}
+
+Cursor* table_end(Table* table) {
+  Cursor* cursor = malloc(sizeof(Cursor));
+  cursor->table = table;
+  cursor->row_num = table->num_rows;
+  cursor->end_of_table = true;
   return cursor;
 }
 
@@ -219,11 +206,16 @@ void cursor_advance(Cursor* cursor) {
   }
 }
 
+// 3. cursor value: returns a pointer to the raw bytes in the page.
 void* cursor_value(Cursor* cursor) {
-  return row_slot(cursor->table, cursor->row_num);
+  uint32_t page_num = cursor->row_num / ROWS_PER_PAGE;
+  void* page = get_page(cursor->table->pager, page_num);
+  uint32_t row_offset = cursor->row_num % ROWS_PER_PAGE;
+  uint32_t byte_offset = row_offset * ROW_SIZE;
+  return page + byte_offset;
 }
 
-// Repl and input buffer (Unchanged from Part 4)
+// Repl and input buffer
 typedef struct {
   char* buffer;
   size_t buffer_length;
@@ -255,7 +247,7 @@ void close_input_buffer(InputBuffer* input_buffer) {
     free(input_buffer);
 }
 
-// Enums and statement (Unchanged from Part 4) ---
+// Enums and statement
 typedef enum { META_COMMAND_SUCCESS, META_COMMAND_UNRECOGNIZED_COMMAND } MetaCommandResult;
 typedef enum { PREPARE_SUCCESS, PREPARE_UNRECOGNIZED_STATEMENT, PREPARE_SYNTAX_ERROR, PREPARE_STRING_TOO_LONG, PREPARE_NEGATIVE_ID } PrepareResult;
 typedef enum { STATEMENT_INSERT, STATEMENT_SELECT } StatementType;
@@ -269,14 +261,14 @@ typedef struct {
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
   if (strcmp(input_buffer->buffer, ".exit") == 0) {
     close_input_buffer(input_buffer);
-    db_close(table); // New line: must close the DB to save to disk.
+    db_close(table);
     exit(EXIT_SUCCESS);
   } else {
     return META_COMMAND_UNRECOGNIZED_COMMAND;
   }
 }
 
-// Compiler (Unchanged from Part 4)
+// Compiler
 PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
   statement->type = STATEMENT_INSERT;
   char* keyword = strtok(input_buffer->buffer, " ");
@@ -310,24 +302,30 @@ void print_row(Row* row) {
   printf("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
 
+// 4. updated execute_insert: uses table_end() to find the insertion point.
 void execute_insert(Statement* statement, Table* table) {
   if (table->num_rows >= TABLE_MAX_ROWS) {
     printf("Error: Table full.\n");
     return;
   }
+
   Row* row_to_insert = &(statement->row_to_insert);
-  // Get the memory location for the new row and serialize the data into it.
-  void* node = row_slot(table, table->num_rows);
-  serialize_row(row_to_insert, node);
+  Cursor* cursor = table_end(table);
+
+  // Serialize directly into the memory location pointed to by the cursor.
+  serialize_row(row_to_insert, cursor_value(cursor));
   table->num_rows += 1;
+
+  free(cursor);
   printf("Executed.\n");
 }
 
+// 5. updated execute_select: uses table_start() and deserializes from the cursor pointer.
 void execute_select(Statement* statement, Table* table) {
   Cursor* cursor = table_start(table);
   Row row;
   while (!(cursor->end_of_table)) {
-    // Deserialize the bytes from memory back into a row struct to print it.
+    // Gets the raw bytes from the cursor then deserialize them into a Row struct.
     deserialize_row(cursor_value(cursor), &row);
     print_row(&row);
     cursor_advance(cursor);
@@ -343,9 +341,8 @@ void execute_statement(Statement* statement, Table* table) {
   }
 }
 
-// Main function
+// Main
 int main(int argc, char* argv[]) {
-  // New line: We now require a filename to be passed as an argument
   if (argc < 2) {
     printf("Must supply a database filename.\n");
     exit(EXIT_FAILURE);
