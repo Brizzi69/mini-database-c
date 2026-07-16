@@ -55,7 +55,7 @@ const uint32_t LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_
 // Enums
 enum NodeType { NODE_LEAF, NODE_INTERNAL };
 
-// Serialization 
+// Serialization
 void serialize_row(Row* source, void* destination) {
   memcpy(destination + ID_OFFSET, &(source->id), ID_SIZE);
   strncpy(destination + USERNAME_OFFSET, source->username, USERNAME_SIZE);
@@ -86,7 +86,7 @@ typedef struct {
   bool end_of_table;
 } Cursor;
 
-// Node accessor functions (new for part 7)
+// Node accessor functions
 uint8_t* node_type(void* node) { return node + NODE_TYPE_OFFSET; }
 
 bool is_node_root(void* node) {
@@ -149,6 +149,31 @@ void* get_page(Pager* pager, uint32_t page_num) {
   return pager->pages[page_num];
 }
 
+// B-tree search (new for part 8)
+// Binary search to find the correct position for a key in a leaf node.
+uint32_t leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
+  void* node = get_page(table->pager, page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+
+  uint32_t min_index = 0;
+  uint32_t one_past_max_index = num_cells;
+  
+  while (one_past_max_index != min_index) {
+    uint32_t index = (min_index + one_past_max_index) / 2;
+    uint32_t key_at_index = *leaf_node_key(node, index);
+    
+    if (key == key_at_index) {
+      return index;
+    }
+    if (key < key_at_index) {
+      one_past_max_index = index;
+    } else {
+      min_index = index + 1;
+    }
+  }
+  return min_index;
+}
+
 Pager* pager_open(const char* filename) {
   int fd = open(filename, O_RDWR | O_CREAT, S_IWUSR | S_IRUSR);
   if (fd == -1) {
@@ -169,7 +194,6 @@ Pager* pager_open(const char* filename) {
   return pager;
 }
 
-// Updated for part 7: initializes the root node as an empty leaf node.
 Table* db_open(const char* filename) {
   Pager* pager = pager_open(filename);
 
@@ -206,7 +230,6 @@ void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
   }
 }
 
-// Updated for part 7: flushes the root node to disk.
 void db_close(Table* table) {
   Pager* pager = table->pager;
   
@@ -223,7 +246,7 @@ void db_close(Table* table) {
   free(table);
 }
 
-// Cursor functions
+// Cursor function
 Cursor* table_start(Table* table) {
   Cursor* cursor = malloc(sizeof(Cursor));
   cursor->table = table;
@@ -295,7 +318,7 @@ void close_input_buffer(InputBuffer* input_buffer) {
 typedef enum { 
   META_COMMAND_SUCCESS, 
   META_COMMAND_UNRECOGNIZED_COMMAND,
-  META_COMMAND_BTREE // New line added for part 7
+  META_COMMAND_BTREE 
 } MetaCommandResult;
 
 typedef enum { PREPARE_SUCCESS, PREPARE_UNRECOGNIZED_STATEMENT, PREPARE_SYNTAX_ERROR, PREPARE_STRING_TOO_LONG, PREPARE_NEGATIVE_ID } PrepareResult;
@@ -306,8 +329,7 @@ typedef struct {
   Row row_to_insert;
 } Statement;
 
-// Meta command 
-// New for part 7: helps to print the B-Tree structure
+// Meta commands
 void print_leaf_node(void* node) {
   uint32_t num_cells = *leaf_node_num_cells(node);
   printf("leaf (size %d)\n", num_cells);
@@ -322,7 +344,7 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
     close_input_buffer(input_buffer);
     db_close(table);
     exit(EXIT_SUCCESS);
-  } else if (strcmp(input_buffer->buffer, ".btree") == 0) { // New line for part 7
+  } else if (strcmp(input_buffer->buffer, ".btree") == 0) {
     printf("Tree:\n");
     print_leaf_node(get_page(table->pager, table->root_page_num));
     return META_COMMAND_SUCCESS;
@@ -365,7 +387,6 @@ void print_row(Row* row) {
   printf("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
 
-// Updated for part 7: still just appends to the end
 void execute_insert(Statement* statement, Table* table) {
   void* node = get_page(table->pager, table->root_page_num);
   uint32_t num_cells = *leaf_node_num_cells(node);
@@ -377,10 +398,25 @@ void execute_insert(Statement* statement, Table* table) {
 
   Row* row_to_insert = &(statement->row_to_insert);
   uint32_t key_to_insert = row_to_insert->id;
+  
+  uint32_t index_to_insert = leaf_node_find(table, table->root_page_num, key_to_insert);
+  
+  if (index_to_insert < num_cells) {
+    uint32_t key_at_index = *leaf_node_key(node, index_to_insert);
+    if (key_at_index == key_to_insert) {
+      printf("Error: Duplicate key.\n");
+      return;
+    }
+  }
 
-  // Just append to the end of the leaf node
-  *leaf_node_key(node, num_cells) = key_to_insert;
-  serialize_row(row_to_insert, leaf_node_value(node, num_cells));
+  for (uint32_t i = num_cells; i > index_to_insert; i--) {
+    void* destination = leaf_node_cell(node, i);
+    void* source = leaf_node_cell(node, i - 1);
+    memcpy(destination, source, LEAF_NODE_CELL_SIZE);
+  }
+
+  *leaf_node_key(node, index_to_insert) = key_to_insert;
+  serialize_row(row_to_insert, leaf_node_value(node, index_to_insert));
   *leaf_node_num_cells(node) = num_cells + 1;
 
   printf("Executed.\n");
