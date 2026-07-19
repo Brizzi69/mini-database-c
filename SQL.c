@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <unistd.h>
 
-// Constants and macros
+// constans and macros
 #define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
 
 const uint32_t COLUMN_USERNAME_SIZE = 32;
@@ -39,7 +39,7 @@ const uint32_t PARENT_POINTER_SIZE = sizeof(uint32_t);
 const uint32_t PARENT_POINTER_OFFSET = IS_ROOT_OFFSET + IS_ROOT_SIZE;
 const uint8_t COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE;
 
-// Leaf node constants
+// Leaf header constants
 const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);
 const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
 const uint32_t LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE;
@@ -52,11 +52,10 @@ const uint32_t LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
 const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
 const uint32_t LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
 
-// New for part 9: split counts for dividing cells between nodes
 const uint32_t LEAF_NODE_RIGHT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) / 2;
 const uint32_t LEAF_NODE_LEFT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) - LEAF_NODE_RIGHT_SPLIT_COUNT;
 
-// NNew for part 9: internal node constants
+// Internal node constants
 const uint32_t INTERNAL_NODE_NUM_KEYS_SIZE = sizeof(uint32_t);
 const uint32_t INTERNAL_NODE_NUM_KEYS_OFFSET = COMMON_NODE_HEADER_SIZE;
 const uint32_t INTERNAL_NODE_RIGHT_CHILD_SIZE = sizeof(uint32_t);
@@ -72,7 +71,7 @@ const uint32_t INTERNAL_NODE_MAX_CELLS = INTERNAL_NODE_SPACE_FOR_CELLS / INTERNA
 // Enums
 enum NodeType { NODE_LEAF, NODE_INTERNAL };
 
-// Serialization 
+// Serialization
 void serialize_row(Row* source, void* destination) {
   memcpy(destination + ID_OFFSET, &(source->id), ID_SIZE);
   strncpy(destination + USERNAME_OFFSET, source->username, USERNAME_SIZE);
@@ -89,7 +88,7 @@ void deserialize_row(void* source, Row* destination) {
 typedef struct {
   int file_descriptor;
   uint32_t file_length;
-  uint32_t num_pages; // NNew for part 9: track total allocated pages
+  uint32_t num_pages;
   void* pages[TABLE_MAX_PAGES];
 } Pager;
 
@@ -137,7 +136,7 @@ void initialize_leaf_node(void* node) {
   *leaf_node_num_cells(node) = 0;
 }
 
-// New for part 9: internal node accessor functions
+// Internal node accessor
 uint32_t* internal_node_num_keys(void* node) {
   return node + INTERNAL_NODE_NUM_KEYS_OFFSET;
 }
@@ -196,7 +195,6 @@ void* get_page(Pager* pager, uint32_t page_num) {
   return pager->pages[page_num];
 }
 
-// New for part 9: allocate a new page and return its number
 uint32_t allocate_page(Pager* pager) {
   void* page = get_page(pager, pager->num_pages);
   return pager->num_pages++;
@@ -214,7 +212,6 @@ Pager* pager_open(const char* filename) {
   Pager* pager = malloc(sizeof(Pager));
   pager->file_descriptor = fd;
   pager->file_length = file_length;
-  // New for part 9: initialize num_pages
   pager->num_pages = (file_length / PAGE_SIZE);
   if (file_length % PAGE_SIZE != 0) {
     pager->num_pages += 1;
@@ -239,7 +236,7 @@ Table* db_open(const char* filename) {
     *node_type(root_node) = NODE_LEAF;
     set_node_root(root_node, true);
     initialize_leaf_node(root_node);
-    pager->num_pages += 1; // New for part 9: account for root page
+    pager->num_pages += 1;
   }
 
   return table;
@@ -267,7 +264,6 @@ void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
 void db_close(Table* table) {
   Pager* pager = table->pager;
   
-  // New for part 9: flush all pages
   for (uint32_t i = 0; i < pager->num_pages; i++) {
     if (pager->pages[i] == NULL) continue;
     pager_flush(pager, i, PAGE_SIZE);
@@ -308,7 +304,26 @@ uint32_t leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
   return min_index;
 }
 
-// New for part 9: gets the maximum key in a node
+uint32_t internal_node_find(Table* table, uint32_t page_num, uint32_t key) {
+  void* node = get_page(table->pager, page_num);
+  uint32_t num_keys = *internal_node_num_keys(node);
+
+  uint32_t min_index = 0;
+  uint32_t one_past_max_index = num_keys;
+  
+  while (one_past_max_index != min_index) {
+    uint32_t index = (min_index + one_past_max_index) / 2;
+    uint32_t key_to_right = *internal_node_key(node, index);
+    
+    if (key_to_right >= key) {
+      one_past_max_index = index;
+    } else {
+      min_index = index + 1;
+    }
+  }
+  return min_index;
+}
+
 uint32_t get_node_max_key(void* node) {
   if (*node_type(node) == NODE_LEAF) {
     return *leaf_node_key(node, *leaf_node_num_cells(node) - 1);
@@ -318,27 +333,59 @@ uint32_t get_node_max_key(void* node) {
 
 // Cursor functions
 Cursor* table_start(Table* table) {
-  Cursor* cursor = malloc(sizeof(Cursor));
-  cursor->table = table;
-  cursor->cell_num = 0;
-
   void* root_node = get_page(table->pager, table->root_page_num);
-  uint32_t num_cells = *leaf_node_num_cells(root_node);
-  cursor->end_of_table = (num_cells == 0);
-
-  return cursor;
+  
+  if (*node_type(root_node) == NODE_LEAF) {
+    Cursor* cursor = malloc(sizeof(Cursor));
+    cursor->table = table;
+    cursor->cell_num = 0;
+    uint32_t num_cells = *leaf_node_num_cells(root_node);
+    cursor->end_of_table = (num_cells == 0);
+    return cursor;
+  } else {
+    uint32_t child_page_num = *internal_node_child(root_node, 0);
+    void* child_node = get_page(table->pager, child_page_num);
+    
+    while (*node_type(child_node) != NODE_LEAF) {
+      child_page_num = *internal_node_child(child_node, 0);
+      child_node = get_page(table->pager, child_page_num);
+    }
+    
+    Cursor* cursor = malloc(sizeof(Cursor));
+    cursor->table = table;
+    cursor->cell_num = 0;
+    uint32_t num_cells = *leaf_node_num_cells(child_node);
+    cursor->end_of_table = (num_cells == 0);
+    return cursor;
+  }
 }
 
 Cursor* table_end(Table* table) {
   void* root_node = get_page(table->pager, table->root_page_num);
-  uint32_t num_cells = *leaf_node_num_cells(root_node);
-
-  Cursor* cursor = malloc(sizeof(Cursor));
-  cursor->table = table;
-  cursor->cell_num = num_cells;
-  cursor->end_of_table = true;
-
-  return cursor;
+  
+  if (*node_type(root_node) == NODE_LEAF) {
+    uint32_t num_cells = *leaf_node_num_cells(root_node);
+    Cursor* cursor = malloc(sizeof(Cursor));
+    cursor->table = table;
+    cursor->cell_num = num_cells;
+    cursor->end_of_table = true;
+    return cursor;
+  } else {
+    uint32_t child_page_num = *internal_node_right_child(root_node);
+    void* child_node = get_page(table->pager, child_page_num);
+    
+    while (*node_type(child_node) != NODE_LEAF) {
+      child_page_num = *internal_node_right_child(child_node);
+      child_node = get_page(table->pager, child_page_num);
+    }
+    
+    uint32_t num_cells = *leaf_node_num_cells(child_node);
+    Cursor* cursor = malloc(sizeof(Cursor));
+    cursor->table = table;
+    cursor->cell_num = num_cells;
+    cursor->end_of_table = true;
+    return cursor;
+  }
 }
 
 void cursor_advance(Cursor* cursor) {
@@ -386,7 +433,7 @@ void close_input_buffer(InputBuffer* input_buffer) {
     free(input_buffer);
 }
 
-// Enums and statement
+// Enums and statements
 typedef enum { 
   META_COMMAND_SUCCESS, 
   META_COMMAND_UNRECOGNIZED_COMMAND,
@@ -394,14 +441,39 @@ typedef enum {
 } MetaCommandResult;
 
 typedef enum { PREPARE_SUCCESS, PREPARE_UNRECOGNIZED_STATEMENT, PREPARE_SYNTAX_ERROR, PREPARE_STRING_TOO_LONG, PREPARE_NEGATIVE_ID } PrepareResult;
-typedef enum { STATEMENT_INSERT, STATEMENT_SELECT } StatementType;
+
+// New: extended statement types
+typedef enum { 
+  STATEMENT_INSERT, 
+  STATEMENT_SELECT,
+  STATEMENT_DELETE,
+  STATEMENT_UPDATE
+} StatementType;
+
+// New: column types for WHERE clause
+typedef enum {
+  COLUMN_ID,
+  COLUMN_USERNAME,
+  COLUMN_EMAIL
+} ColumnType;
+
+// New: where clause structure
+typedef struct {
+  bool has_where;
+  ColumnType column;
+  char value[256];
+  uint32_t id_value;
+} WhereClause;
 
 typedef struct {
   StatementType type;
   Row row_to_insert;
+  WhereClause where;
+  // For UPDATE
+  Row row_to_update;
 } Statement;
 
-// Meta command 
+// Meta command
 void print_leaf_node(void* node) {
   uint32_t num_cells = *leaf_node_num_cells(node);
   printf("leaf (size %d)\n", num_cells);
@@ -425,7 +497,7 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
   }
 }
 
-// Compiler 
+// Compile
 PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
   statement->type = STATEMENT_INSERT;
   char* keyword = strtok(input_buffer->buffer, " ");
@@ -445,11 +517,129 @@ PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
   return PREPARE_SUCCESS;
 }
 
+// New: parse WHERE clause
+bool parse_where_clause(char* input, WhereClause* where) {
+  char* where_pos = strstr(input, " WHERE ");
+  if (where_pos == NULL) {
+    where->has_where = false;
+    return true;
+  }
+  
+  where->has_where = true;
+  where_pos += 7; // Skip "WHERE"
+  
+  // Parse column name
+  if (strncmp(where_pos, "id = ", 5) == 0) {
+    where->column = COLUMN_ID;
+    where->id_value = atoi(where_pos + 5);
+    sprintf(where->value, "%u", where->id_value);
+  } else if (strncmp(where_pos, "username = '", 12) == 0) {
+    where->column = COLUMN_USERNAME;
+    char* end_quote = strchr(where_pos + 12, '\'');
+    if (end_quote == NULL) return false;
+    strncpy(where->value, where_pos + 12, end_quote - (where_pos + 12));
+    where->value[end_quote - (where_pos + 12)] = '\0';
+  } else if (strncmp(where_pos, "email = '", 9) == 0) {
+    where->column = COLUMN_EMAIL;
+    char* end_quote = strchr(where_pos + 9, '\'');
+    if (end_quote == NULL) return false;
+    strncpy(where->value, where_pos + 9, end_quote - (where_pos + 9));
+    where->value[end_quote - (where_pos + 9)] = '\0';
+  } else {
+    return false;
+  }
+  
+  return true;
+}
+
+// New: check if a row matches the WHERE clause
+bool row_matches_where(Row* row, WhereClause* where) {
+  if (!where->has_where) return true;
+  
+  switch (where->column) {
+    case COLUMN_ID:
+      return row->id == where->id_value;
+    case COLUMN_USERNAME:
+      return strcmp(row->username, where->value) == 0;
+    case COLUMN_EMAIL:
+      return strcmp(row->email, where->value) == 0;
+  }
+  return false;
+}
+
+PrepareResult prepare_select(InputBuffer* input_buffer, Statement* statement) {
+  statement->type = STATEMENT_SELECT;
+  if (!parse_where_clause(input_buffer->buffer, &statement->where)) {
+    return PREPARE_SYNTAX_ERROR;
+  }
+  return PREPARE_SUCCESS;
+}
+
+PrepareResult prepare_delete(InputBuffer* input_buffer, Statement* statement) {
+  statement->type = STATEMENT_DELETE;
+  if (!parse_where_clause(input_buffer->buffer, &statement->where)) {
+    return PREPARE_SYNTAX_ERROR;
+  }
+  // "DELETE" requires a "WHERE" clause
+  if (!statement->where.has_where) {
+    return PREPARE_SYNTAX_ERROR;
+  }
+  return PREPARE_SUCCESS;
+}
+
+PrepareResult prepare_update(InputBuffer* input_buffer, Statement* statement) {
+  statement->type = STATEMENT_UPDATE;
+  
+  // Parse example UPDATE id = 15 SET username = 'newname' email = 'new@email.com'
+  char* set_pos = strstr(input_buffer->buffer, " SET ");
+  if (set_pos == NULL) return PREPARE_SYNTAX_ERROR;
+  
+  // Parse WHERE clause, must come after SET
+  char* where_pos = strstr(set_pos, " WHERE ");
+  if (where_pos == NULL) return PREPARE_SYNTAX_ERROR;
+  
+  if (!parse_where_clause(input_buffer->buffer, &statement->where)) {
+    return PREPARE_SYNTAX_ERROR;
+  }
+  
+  // Parse SET values
+  char* set_values = set_pos + 5;
+  char* username_start = strstr(set_values, "username = '");
+  char* email_start = strstr(set_values, "email = '");
+  
+  if (username_start) {
+    username_start += 12;
+    char* end_quote = strchr(username_start, '\'');
+    if (end_quote) {
+      strncpy(statement->row_to_update.username, username_start, end_quote - username_start);
+      statement->row_to_update.username[end_quote - username_start] = '\0';
+    }
+  }
+  
+  if (email_start) {
+    email_start += 9;
+    char* end_quote = strchr(email_start, '\'');
+    if (end_quote) {
+      strncpy(statement->row_to_update.email, email_start, end_quote - email_start);
+      statement->row_to_update.email[end_quote - email_start] = '\0';
+    }
+  }
+  
+  return PREPARE_SUCCESS;
+}
+
 PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement) {
-  if (strncmp(input_buffer->buffer, "insert", 6) == 0) return prepare_insert(input_buffer, statement);
-  if (strcmp(input_buffer->buffer, "select") == 0) {
-    statement->type = STATEMENT_SELECT;
-    return PREPARE_SUCCESS;
+  if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
+    return prepare_insert(input_buffer, statement);
+  }
+  if (strncmp(input_buffer->buffer, "select", 6) == 0) {
+    return prepare_select(input_buffer, statement);
+  }
+  if (strncmp(input_buffer->buffer, "delete", 6) == 0) {
+    return prepare_delete(input_buffer, statement);
+  }
+  if (strncmp(input_buffer->buffer, "update", 6) == 0) {
+    return prepare_update(input_buffer, statement);
   }
   return PREPARE_UNRECOGNIZED_STATEMENT;
 }
@@ -459,18 +649,15 @@ void print_row(Row* row) {
   printf("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
 
-// New for part 9: create a new root internal node when old root splits
 void create_new_root(Table* table, uint32_t right_child_page_num) {
   void* root = get_page(table->pager, table->root_page_num);
   void* right_child = get_page(table->pager, right_child_page_num);
   uint32_t left_child_page_num = allocate_page(table->pager);
   void* left_child = get_page(table->pager, left_child_page_num);
 
-  // Left child gets the old root's data
   memcpy(left_child, root, PAGE_SIZE);
   set_node_root(left_child, false);
 
-  // Root becomes an internal node
   *node_type(root) = NODE_INTERNAL;
   set_node_root(root, true);
   *internal_node_num_keys(root) = 1;
@@ -480,7 +667,6 @@ void create_new_root(Table* table, uint32_t right_child_page_num) {
   *internal_node_right_child(root) = right_child_page_num;
 }
 
-// New for part 9: split a full leaf node and insert the new key
 void leaf_node_split_and_insert(Table* table, uint32_t page_num, uint32_t key, Row* value) {
   void* old_node = get_page(table->pager, page_num);
   uint32_t old_max = get_node_max_key(old_node);
@@ -491,23 +677,19 @@ void leaf_node_split_and_insert(Table* table, uint32_t page_num, uint32_t key, R
   *node_type(new_node) = NODE_LEAF;
   set_node_root(new_node, false);
 
-  // If old node was root, create new root
   if (is_node_root(old_node)) {
     create_new_root(table, new_page_num);
   }
 
-  // Copy right half of cells to new node
   for (uint32_t i = 0; i < LEAF_NODE_RIGHT_SPLIT_COUNT; i++) {
     void* destination = leaf_node_cell(new_node, i);
     void* source = leaf_node_cell(old_node, i + LEAF_NODE_LEFT_SPLIT_COUNT);
     memcpy(destination, source, LEAF_NODE_CELL_SIZE);
   }
 
-  // Update cell counts
   *leaf_node_num_cells(old_node) = LEAF_NODE_LEFT_SPLIT_COUNT;
   *leaf_node_num_cells(new_node) = LEAF_NODE_RIGHT_SPLIT_COUNT;
 
-  // Determine which node to insert into
   uint32_t index_to_insert;
   void* node_to_insert;
   uint32_t page_to_insert;
@@ -523,7 +705,6 @@ void leaf_node_split_and_insert(Table* table, uint32_t page_num, uint32_t key, R
   uint32_t num_cells = *leaf_node_num_cells(node_to_insert);
   index_to_insert = leaf_node_find(table, page_to_insert, key);
 
-  // Shift cells and insert
   for (uint32_t i = num_cells; i > index_to_insert; i--) {
     void* destination = leaf_node_cell(node_to_insert, i);
     void* source = leaf_node_cell(node_to_insert, i - 1);
@@ -552,13 +733,11 @@ void execute_insert(Statement* statement, Table* table) {
     }
   }
 
-  // New for part 9: split if full instead of erroring
   if (num_cells >= LEAF_NODE_MAX_CELLS) {
     leaf_node_split_and_insert(table, table->root_page_num, key_to_insert, row_to_insert);
     return;
   }
 
-  // Shift cells
   for (uint32_t i = num_cells; i > index_to_insert; i--) {
     void* destination = leaf_node_cell(node, i);
     void* source = leaf_node_cell(node, i - 1);
@@ -572,22 +751,89 @@ void execute_insert(Statement* statement, Table* table) {
   printf("Executed.\n");
 }
 
+// New: execute SELECT with WHERE filtering
 void execute_select(Statement* statement, Table* table) {
   Cursor* cursor = table_start(table);
   Row row;
+  uint32_t count = 0;
+  
   while (!(cursor->end_of_table)) {
     deserialize_row(cursor_value(cursor), &row);
-    print_row(&row);
+    
+    // Only print if it matches the WHERE clause
+    if (row_matches_where(&row, &statement->where)) {
+      print_row(&row);
+      count++;
+    }
+    
     cursor_advance(cursor);
   }
+  
   free(cursor);
-  printf("Executed.\n");
+  printf("%d row(s) returned.\n", count);
+}
+
+// New: execute DELETE with WHERE
+void execute_delete(Statement* statement, Table* table) {
+  void* node = get_page(table->pager, table->root_page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  uint32_t deleted_count = 0;
+  
+  Row row;
+  for (uint32_t i = 0; i < num_cells; i++) {
+    deserialize_row(leaf_node_value(node, i), &row);
+    
+    if (row_matches_where(&row, &statement->where)) {
+      // Shift all subsequent cells left
+      for (uint32_t j = i; j < num_cells - 1; j++) {
+        void* dest = leaf_node_cell(node, j);
+        void* src = leaf_node_cell(node, j + 1);
+        memcpy(dest, src, LEAF_NODE_CELL_SIZE);
+      }
+      num_cells--;
+      *leaf_node_num_cells(node) = num_cells;
+      deleted_count++;
+      i--; 
+    }
+  }
+  
+  printf("%d row(s) deleted.\n", deleted_count);
+}
+
+// New: execute UPDATE with WHERE
+void execute_update(Statement* statement, Table* table) {
+  void* node = get_page(table->pager, table->root_page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  uint32_t updated_count = 0;
+  
+  Row row;
+  for (uint32_t i = 0; i < num_cells; i++) {
+    deserialize_row(leaf_node_value(node, i), &row);
+    
+    if (row_matches_where(&row, &statement->where)) {
+      // Update the fields
+      if (strlen(statement->row_to_update.username) > 0) {
+        strcpy(row.username, statement->row_to_update.username);
+      }
+      if (strlen(statement->row_to_update.email) > 0) {
+        strcpy(row.email, statement->row_to_update.email);
+      }
+      
+      // Write back
+      serialize_row(&row, leaf_node_value(node, i));
+      updated_count++;
+    }
+  }
+  
+  printf("%d row(s) updated.\n", updated_count);
 }
 
 void execute_statement(Statement* statement, Table* table) {
   switch (statement->type) {
     case STATEMENT_INSERT: execute_insert(statement, table); break;
     case STATEMENT_SELECT: execute_select(statement, table); break;
+    case STATEMENT_DELETE: execute_delete(statement, table); break;
+    case STATEMENT_UPDATE: execute_update(statement, table); break;
   }
 }
 
